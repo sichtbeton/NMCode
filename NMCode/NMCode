@@ -1,348 +1,302 @@
 /*
-   NMCode by this.is.NOISE inc. 
-
-   https://github.com/thisisnoiseinc/NMCode
-
-   Built upon:
-    
-    "BLE_MIDI Example by neilbags 
-    https://github.com/neilbags/arduino-esp32-BLE-MIDI
-    
-    Based on BLE_notify example by Evandro Copercini."
+  NOISE Machine — ESP32 BLE-MIDI (r71 — rotary “modifier CC” via held button)
+  Base: r70 (golden build + MIDI channel selector).
+  CHANGE IN THIS FILE ONLY: allow boot-held channel select with buttons 1..12 (not just 1..11).
+  (Everything else is untouched.)
 */
 
-#include <BLEDevice.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <math.h>
 
-#include <BLEUtils.h>
+/* ---------- DEBUG (off by default) ---------- */
+#define DEBUG 0
 
-#include <BLEServer.h>
+/* ---- Pins ---- */
+constexpr int LED_B = 14;                 // Blue LED
+constexpr int LED_G = 4;                  // Green LED
+constexpr int PIN_SLIDER = 36;            // ADC1_CH0
+constexpr int PIN_ROTARY = 39;            // ADC1_CH3
+constexpr int BTN[12] = {16,17,18,21,19,25,22,23,27,26,35,34};
 
-#include <BLE2902.h>
+/* ---- Slider zones (percent cuts) ---- */
+constexpr uint8_t Z1 = 14;
+constexpr uint8_t Z2 = 55;
+constexpr uint8_t Z3 = 75;
 
-#include "esp_bt_main.h"
+/* ---- MIDI ---- */
+uint8_t CH_ON  = 0x90;
+uint8_t CH_OFF = 0x80;
+uint8_t CH_CC  = 0xB0;
+constexpr uint8_t NOTE_BASE = 36;
+constexpr uint8_t NOTES_PER_ZONE = 12;
 
-#include "esp_bt_device.h"
+/* ---- Behavior ---- */
+constexpr uint8_t  BTN_SCAN_MS   = 2;
+constexpr int8_t   DEB_ON        = 2;
+constexpr int8_t   DEB_OFF       = 2;
+constexpr uint16_t RELEASE_GUARD = 12;
 
-#define SERVICE_UUID        "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
+/* ---- Rotary ---- */
+constexpr uint32_t CC_GAP_MS     = 2;
+constexpr float    ROT_CURVE     = 0.85f;
+constexpr uint8_t  ROT_DEADBAND  = 2;
+constexpr float    ROT_EMA_A     = 0.25f;
+constexpr uint8_t  FAST_THRESH   = 4;
+constexpr uint8_t  MED_THRESH    = 2;
+constexpr uint8_t  END_SNAP_BAND = 2;
 
-#define CHARACTERISTIC_UUID "7772e5db-3868-4112-a1a9-f2669d106bf3"
+/* ---- BLE UUIDs ---- */
+static const char SVC_UUID[] = "03b80e5a-ede8-4b33-a751-6ce34ec4c700";
+static const char CHR_UUID[] = "7772e5db-3868-4112-a1a9-f2669d106bf3";
 
+/* ---- BLE handles ---- */
+NimBLEServer*         gServer = nullptr;
+NimBLECharacteristic* gChar   = nullptr;
+NimBLEAdvertising*    gAdv    = nullptr;
 
-int potPin = 36; // Slider
-int rotPin = 39; // Rotary Knob
-bool rotMoving = true;
-int midiCState = 0; // General current state
-int led_Blue = 14; // BLE LED
-int led_Green = 4; // CHANNEL LED
-const int button = 12;
-int potCstate = 0; // Slider current state
-int rotCState = 0; // Rotary Knob current state
-int outputValue = 0;
-int ButtonNote = 0;
-int Channel_SelectON = 0;
-int Channel_SelectOFF = 0;
-int Channel_SelectCC = 0;
-int Buttonselect[button] = {  // Buttons put in order of reference board.
- 16,
- 17,
- 18,
- 21,
- 19,
- 25,
- 22,
- 23,
- 27,
- 26,
- 35,
- 34
-  };
-int buttonCstate[button] = {0}; // Button current state
-int buttonPState[button] = {0}; // Button previous state
-int OffNote[button] = {0};
-int debounceDelay = 5;
-int lastDebounceTime[button] = {0};
-int i = 0;
-const int numReadings = 15;
-int readings[numReadings];      // the readings from the analog input
-int readIndex = 0;              // the index of the current reading
-int total = 0;                  // the running total
-int average1 = 0; // average current state
-int lastaverage1 = 0; // average previous state
+/* ---- Button state ---- */
+int8_t   debCnt[12]     = {0};
+uint8_t  debState[12]   = {0};
+uint8_t  noteOnFlag[12] = {0};
+uint8_t  noteNum[12]    = {0};
+uint32_t lowSince[12]   = {0};
+uint32_t nextScan       = 0;
 
-BLECharacteristic *pCharacteristic;
+/* ---- Other state ---- */
+int zone = 0;
+int rotLast = -1;
+float rotEma = 0.f;
+uint32_t lastCC = 0;
+uint32_t ledMs = 0; bool ledBlink=false;
+bool wasConnected=false;
 
-bool deviceConnected = false;
+/* ---- MIDI channel persistence ---- */
+Preferences prefs;
+uint8_t gMidiCh = 1;
 
-uint8_t midiPacket[] = {
+/* ---- MIDI builder ---- */
+static uint8_t outBuf[5 * 48];
+int outLen = 0;
 
-   0x80,  // header
+inline void ledWrite(int pin, bool on){ digitalWrite(pin, on?HIGH:LOW); }
+inline int  rd12(int pin){ (void)analogRead(pin); int v=analogRead(pin); return v<0?0:(v>4095?4095:v); }
+inline uint8_t pct100(int raw){ return (uint8_t)((raw*100U + 2047)/4095U); }
+inline bool isConnected(){ NimBLEServer* s=NimBLEDevice::getServer(); return s && s->getConnectedCount()>0; }
+inline uint16_t ts13(){ return (uint16_t)(millis() & 0x1FFF); }
 
-   0x80,  // timestamp, not implemented 
+inline void builderReset(){ outLen=0; }
+inline void builderEmit(uint8_t status, uint8_t d1, uint8_t d2){
+  if(outLen + 5 > (int)sizeof(outBuf)) return;
+  uint16_t t=ts13();
+  outBuf[outLen+0]=0x80|(t>>7);
+  outBuf[outLen+1]=0x80|(t&0x7F);
+  outBuf[outLen+2]=status;
+  outBuf[outLen+3]=d1;
+  outBuf[outLen+4]=d2;
+  outLen+=5;
+}
+inline void builderFlush(){
+  if(outLen==0 || !gChar) return;
+  gChar->setValue(outBuf, outLen);
+  gChar->notify();
+  outLen=0;
+}
 
-   0x00,  // status
-
-   0x3c,  // 0x3c == 60 == middle c
-
-   0x00   // velocity
-
+/* ---- BLE callbacks ---- */
+struct SrvCB : public NimBLEServerCallbacks {
+  void onDisconnect(NimBLEServer*) { if(gAdv && !gAdv->isAdvertising()) gAdv->start(); }
+  void onDisconnect(NimBLEServer*, ble_gap_conn_desc*) { if(gAdv && !gAdv->isAdvertising()) gAdv->start(); }
 };
 
-class MyServerCallbacks: public BLEServerCallbacks {
+/* ---- Slider ---- */
+inline uint8_t sliderPct(){ return pct100(rd12(PIN_SLIDER)); }
+inline void initZoneOnce(){
+  int s = rd12(PIN_SLIDER)+rd12(PIN_SLIDER)+rd12(PIN_SLIDER)+rd12(PIN_SLIDER);
+  uint8_t p = pct100(s/4);
+  zone = (p < Z1)?0:(p < Z2)?1:(p < Z3)?2:3;
+  ledWrite(LED_G, (zone==0 || zone==2));
+}
+inline void updateZone(){
+  uint8_t p = sliderPct();
+  int z = (p < Z1)?0:(p < Z2)?1:(p < Z3)?2:3;
+  if(z != zone){ zone=z; ledWrite(LED_G, (zone==0 || zone==2)); }
+}
 
-  void onConnect(BLEServer* pServer) {
+/* ---- Buttons ---- */
+inline void scanButtons(uint32_t now){
+  if(now < nextScan) return; nextScan = now + BTN_SCAN_MS;
+  for(int i=0;i<12;i++){
+    uint8_t pressed = (digitalRead(BTN[i]) == HIGH);
+    if(pressed){ if(debCnt[i] <  DEB_ON)  debCnt[i]++; }
+    else        { if(debCnt[i] > -DEB_OFF) debCnt[i]--; }
 
-    deviceConnected = true;
+    uint8_t stable = debState[i];
+    if(debCnt[i] >=  DEB_ON)  stable = 1;
+    if(debCnt[i] <= -DEB_OFF) stable = 0;
 
-  };
-
-
-
-  void onDisconnect(BLEServer* pServer) {
-
-    deviceConnected = false;
-
-  }
-
-};
-
-bool initBluetooth() {
-  
-  if (!btStart()) {
-
-    Serial.println("Failed to initialize controller");
-    return false;
-    
-  }
- 
-  if (esp_bluedroid_init() != ESP_OK) {
-
-    Serial.println("Failed to initialize bluedroid");
-    return false;
-
-  }
- 
-  if (esp_bluedroid_enable() != ESP_OK) {
-
-    Serial.println("Failed to enable bluedroid");
-    return false;
-
+    if(stable != debState[i]){
+      debState[i] = stable;
+      uint8_t note = (uint8_t)(NOTE_BASE + zone * NOTES_PER_ZONE + i);
+      if(stable){
+        if(noteOnFlag[i]){ builderEmit(CH_OFF, noteNum[i], 0); noteOnFlag[i]=0; }
+        noteNum[i]=note; noteOnFlag[i]=1;
+        builderEmit(CH_ON, note, 100);
+      }else{
+        if(noteOnFlag[i]){ builderEmit(CH_OFF, noteNum[i], 0); noteOnFlag[i]=0; }
+      }
+    }
+    if(!pressed){
+      if(lowSince[i]==0) lowSince[i]=now;
+      if(noteOnFlag[i] && (now - lowSince[i] >= RELEASE_GUARD)){
+        builderEmit(CH_OFF, noteNum[i], 0);
+        noteOnFlag[i]=0;
+      }
+    }else{
+      lowSince[i]=0;
+    }
   }
 }
 
-void setup() {
+/* ---- Rotary target CC ---- */
+inline uint8_t rotaryTargetCC(){
+  for(int i=0;i<12;i++){
+    if(debState[i]) return (uint8_t)(10 + zone*12 + i);
+  }
+  return 100;
+}
 
+/* ---- Rotary ---- */
+inline void rotaryInit(){
+  int r=rd12(PIN_ROTARY);
+  rotEma = (float)r;
+  float n = fminf(1.f, fmaxf(0.f, r/4095.f));
+  n = powf(n, ROT_CURVE);
+  rotLast = (int)(n*127.f + 0.5f);
+}
+inline void rotaryStep(){
+  const uint8_t targetCC = rotaryTargetCC();
+  int raw = rd12(PIN_ROTARY);
+  float n_i = fminf(1.f, fmaxf(0.f, raw/4095.f));
+  n_i = powf(n_i, ROT_CURVE);
+  int v_i = (int)(n_i*127.f + 0.5f);
+  if(v_i <= END_SNAP_BAND) v_i = 0;
+  else if(v_i >= 127 - END_SNAP_BAND) v_i = 127;
+  rotEma = rotEma + ROT_EMA_A * ((float)raw - rotEma);
+  float n_e = fminf(1.f, fmaxf(0.f, rotEma/4095.f));
+  n_e = powf(n_e, ROT_CURVE);
+  int v_e = (int)(n_e*127.f + 0.5f);
+  if(rotLast < 0) rotLast = v_i;
+  int dv_fast = abs(v_i - rotLast);
+  int dv_slow = abs(v_e - rotLast);
+  uint32_t now = millis();
+  if(dv_fast >= FAST_THRESH){
+    if(v_i != rotLast){ builderEmit(CH_CC, targetCC, (uint8_t)v_i); rotLast=v_i; lastCC=now; }
+    return;
+  }
+  if(dv_fast >= MED_THRESH){
+    if(now - lastCC >= CC_GAP_MS && v_i != rotLast){
+      builderEmit(CH_CC, targetCC, (uint8_t)v_i); rotLast=v_i; lastCC=now;
+    }
+    return;
+  }
+  if(dv_slow >= ROT_DEADBAND && (now - lastCC) >= CC_GAP_MS){
+    builderEmit(CH_CC, targetCC, (uint8_t)v_e); rotLast=v_e; lastCC=now;
+  }
+}
+
+/* ---- MIDI channel ---- */
+inline void setMidiChannel(uint8_t ch){
+  if(ch < 1) ch = 1;
+  if(ch > 12) ch = 12;                 // <-- expanded to allow 1..12
+  gMidiCh = ch;
+  CH_ON  = 0x90 | (gMidiCh - 1);
+  CH_OFF = 0x80 | (gMidiCh - 1);
+  CH_CC  = 0xB0 | (gMidiCh - 1);
+}
+
+/* ---- Boot-held channel detection (600ms window) ---- */
+inline uint8_t detectBootHeldChannel(){   // returns 0 if none
+  const uint32_t t_end = millis() + 600;
+  uint16_t mask = 0;
+  while (millis() < t_end) {
+    for (int i = 0; i < 12; i++) {        // <-- include button 12
+      if (digitalRead(BTN[i]) == HIGH) mask |= (1u << i);
+    }
+    delay(5);
+  }
+  if (mask == 0) return 0;
+  for (int i = 0; i < 12; i++) {
+    if (mask & (1u << i)) return (uint8_t)(i + 1);  // BTN12 -> channel 12
+  }
+  return 0;
+}
+
+/* ---- Setup ---- */
+void setup(){
+#if DEBUG
   Serial.begin(115200);
+  delay(150);
+#endif
+  pinMode(LED_B,OUTPUT); pinMode(LED_G,OUTPUT);
+  ledWrite(LED_B,false); ledWrite(LED_G,false);
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_SLIDER, ADC_11db);
+  analogSetPinAttenuation(PIN_ROTARY, ADC_6db);
+  for(int i=0;i<12;i++) pinMode(BTN[i], INPUT);
 
-  initBluetooth();
-  const uint8_t* point = esp_bt_dev_get_address();
- 
-  char str[6];
- 
-  sprintf(str, "NMSVE %02X %02X %02X", (int)point[3], (int)point[4], (int)point[5]);
-  Serial.print(str);
+  prefs.begin("noise", false);
+  uint8_t saved = prefs.getUChar("midich", 1);
+  if(saved < 1 || saved > 12) saved = 1;           // <-- allow saved=12
 
-  BLEDevice::init(str);
-
-  BLEServer *pServer = BLEDevice::createServer();
-
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService *pService = pServer->createService(BLEUUID(SERVICE_UUID));
-
-  pCharacteristic = pService->createCharacteristic(
-
-    BLEUUID(CHARACTERISTIC_UUID),
-
-    BLECharacteristic::PROPERTY_READ   |
-
-    BLECharacteristic::PROPERTY_WRITE  |
-
-    BLECharacteristic::PROPERTY_NOTIFY |
-
-    BLECharacteristic::PROPERTY_WRITE_NR
-
-  );
-
-  pCharacteristic->addDescriptor(new BLE2902());
-
-  pService->start();
-
-  BLEAdvertising *pAdvertising = pServer->getAdvertising();
-
-  pAdvertising->addServiceUUID(pService->getUUID());
-
-  pAdvertising->start();
-
-  for (int i = 0; i < button; i++) {
-
-    pinMode (Buttonselect[i], INPUT);
-    pinMode (led_Blue, OUTPUT);
-    pinMode (led_Green, OUTPUT);
-
+  // detect boot-held channel
+  uint8_t held = detectBootHeldChannel();
+  uint8_t useCh = held ? held : saved;
+  setMidiChannel(useCh);
+  if(held){
+    // persist + one-time confirmation (GREEN LED solid ~500ms)
+    prefs.putUChar("midich", useCh);
+    ledWrite(LED_G, true);
+    delay(500);
+    ledWrite(LED_G, false);
   }
+  prefs.end();
 
-  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
-
-    readings[thisReading] = 0;
-
-  }
-
-  while (Channel_SelectON == 0) {
-  
-    digitalWrite(led_Green, HIGH);
-  
-    for (int i = 0; i < button; i++) {
-
-      buttonCstate[i] = digitalRead(Buttonselect[i]);
-
-      if (buttonCstate[i] == HIGH) {
-
-        Channel_SelectON = (i + 144);
-        Channel_SelectOFF = (i + 128);
-        Channel_SelectCC = (i + 176);
-
-      }
-    }
-  }
-      
-  digitalWrite(led_Green, LOW);
-
+  char name[20]; snprintf(name, sizeof(name), "NOISE-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+  NimBLEDevice::init(name);
+  NimBLEDevice::setDeviceName(name);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+  NimBLEDevice::setMTU(185);
+  gServer = NimBLEDevice::createServer();
+  gServer->setCallbacks(new SrvCB());
+  auto svc = gServer->createService(SVC_UUID);
+  gChar = svc->createCharacteristic(CHR_UUID,
+            NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE_NR);
+  gChar->createDescriptor((uint16_t)0x2902);
+  svc->start();
+  gAdv = NimBLEDevice::getAdvertising();
+  NimBLEAdvertisementData adv; adv.setName(name); adv.addServiceUUID(NimBLEUUID(SVC_UUID));
+  gAdv->setAdvertisementData(adv);
+  gAdv->setMinInterval(160);
+  gAdv->setMaxInterval(240);
+  gAdv->start();
+  initZoneOnce();
+  rotaryInit();
 }
 
+/* ---- Loop ---- */
 void loop(){
-
-  if (deviceConnected == false) { 
-
-    digitalWrite(led_Blue, HIGH);
-    delay(1000);
-    digitalWrite(led_Blue, LOW);
-    delay(1000);
-
+  uint32_t now = millis();
+  bool conn = isConnected();
+  if(!conn){
+    if(now - ledMs >= 300){ ledBlink=!ledBlink; ledMs=now; ledWrite(LED_B,ledBlink); }
+    builderReset();
+    return;
   }
-
-  else {
-
-    digitalWrite(led_Blue, HIGH);
-    BUTTONS();
-    ROTARY();
-
-  }
-}
-
-void BUTTONS() {
-
-  for (int i = 0; i < button; i++) {
-
-    buttonCstate[i] = digitalRead(Buttonselect[i]);
-    potCstate = analogRead(potPin);
-    outputValue = map(potCstate, 0, 4095, 3, 9);
-    ButtonNote = (outputValue * 12 + i);
-
-    if (outputValue == 3 || outputValue == 5 || outputValue == 7 || outputValue == 9) {
-      
-      digitalWrite(led_Green, HIGH);
-
-    }
-
-    else {
-
-      digitalWrite(led_Green, LOW);
-
-    }
- 
-    if ((millis() - lastDebounceTime[i]) > debounceDelay) {
-  
-      if (buttonPState[i] != buttonCstate[i]) {
-
-        lastDebounceTime[i] = millis();
-
-        if (buttonCstate[i] == HIGH) {  
-
-          midiPacket[2] = Channel_SelectON;
-          Serial.println(Channel_SelectON); 
-          midiPacket[3] = ButtonNote;
-          Serial.println(midiPacket[3]);
-          midiPacket[4] = 100;
-          pCharacteristic->setValue(midiPacket, 5);
-          pCharacteristic->notify();
-          OffNote[i] = ButtonNote;
-
-        }
-
-        else {
-
-          midiPacket[2] = Channel_SelectOFF;
-          Serial.println(Channel_SelectOFF);
-          midiPacket[3] = OffNote[i];
-          midiPacket[4] = 0;
-          pCharacteristic->setValue(midiPacket, 5);
-          pCharacteristic->notify();
-
-        }
-
-        buttonPState[i] = buttonCstate[i];
-
-      }
-    }
-  }
-}
-
-void potaverage1() {
-  
-  for (int p = 0; p < 15; p++) {
-
-    rotCState = analogRead(rotPin);
-    midiCState = map(rotCState, 0, 4095, 0, 127);
-  
-    total = total - readings[readIndex];
-    readings[readIndex] = midiCState;
-    total = total + readings[readIndex];
-    readIndex = readIndex + 1;
-
-    if (readIndex >= numReadings) {
-
-      readIndex = 0;
-
-    }
-
-    average1 = total / numReadings;
-    delay(1);
-
-  }
-}
-
-void ROTARY(){
-
-  potaverage1();
- 
-  if (average1 != lastaverage1) {
-
-      rotMoving = true;
-
-    }
-
-  else {
-
-    rotMoving = false;
-
-  }
-
-  if (rotMoving == true) {
-
-    midiPacket[2] = Channel_SelectCC;
-    Serial.println(Channel_SelectCC);
-
-    midiPacket[3] = 0x01;
-    Serial.println(0x01);
-
-    midiPacket[4] = average1;
-    Serial.println(average1);
-
-    pCharacteristic->setValue(midiPacket, 5);
-
-    pCharacteristic->notify();
-
-    lastaverage1 = average1;
-
-  }
+  ledWrite(LED_B,true);
+  builderReset();
+  scanButtons(now);
+  updateZone();
+  rotaryStep();
+  builderFlush();
 }
