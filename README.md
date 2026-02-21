@@ -156,7 +156,7 @@ If host sees the device but no MIDI arrives, see FAQ below.
 
 - Debounce uses signed integrator counters (`DEB_ON/DEB_OFF`) scanned every `BTN_SCAN_MS`.
 - Release guard (`RELEASE_GUARD`) protects against rapid false-off transitions.
-- Rotary path applies nonlinear response (`ROT_CURVE`) and movement gating (`FAST_THRESH`, `MED_THRESH`, `ROT_DEADBAND`, `CC_GAP_MS`).
+- Rotary path applies a nonlinear response curve (`ROT_CURVE`) and sends CC immediately when the mapped value changes.
 - BLE disconnect callback restarts advertising automatically.
 - Device name includes lower 16 bits of eFuse MAC (`NOISE-%04X`).
 
@@ -170,18 +170,13 @@ If host sees the device but no MIDI arrives, see FAQ below.
 - Confirm channel expected by app matches selected channel.
 - Reboot while holding button 1 to force known channel 1.
 
-### 2) “Rotary feels too filtered / not snappy enough”
+### 2) “Rotary feels too sensitive / too coarse”
 
-Potential tuning constants:
+Main tuning constant:
 
 - `ROT_CURVE`
-- `CC_GAP_MS`
-- `FAST_THRESH`
-- `MED_THRESH`
-- `ROT_DEADBAND`
-- `ROT_EMA_A`
 
-Lower filtering values increase responsiveness, but can increase jitter.
+Higher values bias more resolution toward one side of the turn; lower values feel more linear.
 
 ### 3) “Need wider MIDI channel support (1..16)”
 

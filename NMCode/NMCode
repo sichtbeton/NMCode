@@ -38,13 +38,7 @@ constexpr int8_t   DEB_OFF       = 2;
 constexpr uint16_t RELEASE_GUARD = 12;
 
 /* ---- Rotary ---- */
-constexpr uint32_t CC_GAP_MS     = 2;
 constexpr float    ROT_CURVE     = 0.85f;
-constexpr uint8_t  ROT_DEADBAND  = 2;
-constexpr float    ROT_EMA_A     = 0.25f;
-constexpr uint8_t  FAST_THRESH   = 4;
-constexpr uint8_t  MED_THRESH    = 2;
-constexpr uint8_t  END_SNAP_BAND = 2;
 
 /* ---- BLE UUIDs ---- */
 static const char SVC_UUID[] = "03b80e5a-ede8-4b33-a751-6ce34ec4c700";
@@ -66,8 +60,6 @@ uint32_t nextScan       = 0;
 /* ---- Other state ---- */
 int zone = 0;
 int rotLast = -1;
-float rotEma = 0.f;
-uint32_t lastCC = 0;
 uint32_t ledMs = 0; bool ledBlink=false;
 bool wasConnected=false;
 
@@ -169,7 +161,6 @@ inline uint8_t rotaryTargetCC(){
 /* ---- Rotary ---- */
 inline void rotaryInit(){
   int r=rd12(PIN_ROTARY);
-  rotEma = (float)r;
   float n = fminf(1.f, fmaxf(0.f, r/4095.f));
   n = powf(n, ROT_CURVE);
   rotLast = (int)(n*127.f + 0.5f);
@@ -177,32 +168,11 @@ inline void rotaryInit(){
 inline void rotaryStep(){
   const uint8_t targetCC = rotaryTargetCC();
   int raw = rd12(PIN_ROTARY);
-  float n_i = fminf(1.f, fmaxf(0.f, raw/4095.f));
-  n_i = powf(n_i, ROT_CURVE);
-  int v_i = (int)(n_i*127.f + 0.5f);
-  if(v_i <= END_SNAP_BAND) v_i = 0;
-  else if(v_i >= 127 - END_SNAP_BAND) v_i = 127;
-  rotEma = rotEma + ROT_EMA_A * ((float)raw - rotEma);
-  float n_e = fminf(1.f, fmaxf(0.f, rotEma/4095.f));
-  n_e = powf(n_e, ROT_CURVE);
-  int v_e = (int)(n_e*127.f + 0.5f);
-  if(rotLast < 0) rotLast = v_i;
-  int dv_fast = abs(v_i - rotLast);
-  int dv_slow = abs(v_e - rotLast);
-  uint32_t now = millis();
-  if(dv_fast >= FAST_THRESH){
-    if(v_i != rotLast){ builderEmit(CH_CC, targetCC, (uint8_t)v_i); rotLast=v_i; lastCC=now; }
-    return;
-  }
-  if(dv_fast >= MED_THRESH){
-    if(now - lastCC >= CC_GAP_MS && v_i != rotLast){
-      builderEmit(CH_CC, targetCC, (uint8_t)v_i); rotLast=v_i; lastCC=now;
-    }
-    return;
-  }
-  if(dv_slow >= ROT_DEADBAND && (now - lastCC) >= CC_GAP_MS){
-    builderEmit(CH_CC, targetCC, (uint8_t)v_e); rotLast=v_e; lastCC=now;
-  }
+  float n = fminf(1.f, fmaxf(0.f, raw/4095.f));
+  n = powf(n, ROT_CURVE);
+  int v = (int)(n*127.f + 0.5f);
+  if(rotLast < 0) rotLast = v;
+  if(v != rotLast){ builderEmit(CH_CC, targetCC, (uint8_t)v); rotLast=v; }
 }
 
 /* ---- MIDI channel ---- */
